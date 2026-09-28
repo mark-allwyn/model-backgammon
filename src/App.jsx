@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Play, Pause, SkipForward, RotateCcw, Trophy } from "lucide-react";
+import { Play, Pause, SkipForward, RotateCcw, Trophy, Brain } from "lucide-react";
 
 /* ============================ ENGINE (tested) ============================ */
 const sign = (pl) => (pl === "W" ? 1 : -1);
@@ -154,12 +154,12 @@ function heuristicPick(plays, pl) {
   });
   return best;
 }
-async function callClaude(model, system, userContent) {
+async function callClaude(model, system, userContent, thinking) {
   // Calls the local proxy (server/index.mjs), which runs the move on your
   // Claude subscription via the Agent SDK. See vite.config.js for the /api proxy.
   const res = await fetch("/api/move", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, system, user: userContent }),
+    body: JSON.stringify({ model, system, user: userContent, thinking: !!thinking }),
   });
   const data = await res.json();
   if (!res.ok || data.error) throw new Error(data.error || ("http " + res.status));
@@ -167,7 +167,7 @@ async function callClaude(model, system, userContent) {
   const m = txt.match(/\{[\s\S]*\}/);
   return JSON.parse(m ? m[0] : txt);
 }
-async function askModel(board, pl, dice, plays, modelId) {
+async function askModel(board, pl, dice, plays, modelId, thinking) {
   const colorName = pl === "W" ? "White (ivory)" : "Black (ebony)";
   const system = `You are ${MODEL_NAME(modelId)}, playing backgammon as ${colorName} at a world-class level. You will be shown the position and a numbered list of every legal play for your dice. Pick the single strongest play and briefly explain the idea behind it. Respond with ONLY a JSON object of the form {"choice": <int>, "reasoning": "<one sentence, max 28 words>"} and nothing else.`;
   const user = buildPrompt(board, pl, dice, plays);
@@ -177,9 +177,9 @@ async function askModel(board, pl, dice, plays, modelId) {
     const reasoning = typeof obj.reasoning === "string" && obj.reasoning.trim() ? obj.reasoning.trim() : "Playing the strongest line I see.";
     return { choice, reasoning };
   };
-  try { return parse(await callClaude(modelId, system, user)); }
+  try { return parse(await callClaude(modelId, system, user, thinking)); }
   catch (e1) {
-    try { return parse(await callClaude("claude-sonnet-4-6", system, user)); }
+    try { return parse(await callClaude("claude-sonnet-4-6", system, user, thinking)); }
     catch (e2) { return { choice: heuristicPick(plays, pl), reasoning: "(Reading the board directly - reaching for the sharpest line available.)" }; }
   }
 }
@@ -469,15 +469,18 @@ export default function App() {
   const [highlight, setHighlight] = useState(null);
   const [log, setLog] = useState([]);
   const [win, setWin] = useState(null);
-  const [speed, setSpeed] = useState("normal");
+  const [speed, setSpeed] = useState("fast");
+  const [thinking, setThinking] = useState(false);
   const [flyerW, setFlyerW] = useState(true);
 
   const boardRef = useRef(board), turnRef = useRef(turn), runningRef = useRef(false);
   const modelsRef = useRef(models), speedRef = useRef(speed), runId = useRef(0), moveNo = useRef(0);
+  const thinkingRef = useRef(thinking);
   const flyerRef = useRef(null);
 
   useEffect(() => { modelsRef.current = models; }, [models]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
+  useEffect(() => { thinkingRef.current = thinking; }, [thinking]);
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
@@ -526,7 +529,7 @@ export default function App() {
     else if (plays.length === 1) { chosen = plays[0]; reasoning = "Only one legal play here - it makes itself."; }
     else {
       setPhase("thinking"); setThinkingSide(pl); setReason((r) => ({ ...r, [pl]: "" }));
-      const res = await askModel(boardRef.current, pl, d, plays, modelsRef.current[pl]);
+      const res = await askModel(boardRef.current, pl, d, plays, modelsRef.current[pl], thinkingRef.current);
       if (runId.current !== myId) return;
       chosen = plays[res.choice]; reasoning = res.reasoning;
     }
@@ -590,6 +593,7 @@ export default function App() {
             <div className="speed" role="group" aria-label="Speed">
               {["slow", "normal", "fast"].map((s) => <button key={s} className={speed === s ? "on" : ""} onClick={() => setSpeed(s)}>{s[0].toUpperCase() + s.slice(1)}</button>)}
             </div>
+            <button className={`btn${thinking ? " primary" : ""}`} onClick={() => setThinking((t) => !t)} aria-pressed={thinking} title={thinking ? "Extended thinking on - deeper play, slower moves" : "Extended thinking off - fast moves"}><Brain size={16} />Thinking</button>
             <button className="btn" onClick={step} disabled={busy || !!win}><SkipForward size={16} />Step</button>
             {running
               ? <button className="btn" onClick={pause}><Pause size={16} />Pause</button>

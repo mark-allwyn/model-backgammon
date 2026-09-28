@@ -13,6 +13,13 @@ import { createServer } from "node:http";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 const PORT = Number(process.env.TABULA_PORT) || 8787;
+// A move that takes longer than this is abandoned so the game never stalls;
+// the UI then falls back to its built-in heuristic for that move.
+const MOVE_TIMEOUT_MS = Number(process.env.TABULA_MOVE_TIMEOUT_MS) || 12000;
+// When the UI asks for extended thinking, allow a bounded budget and a longer
+// timeout so the deeper reasoning has room to finish.
+const THINK_BUDGET = Number(process.env.TABULA_THINK_BUDGET) || 4000;
+const THINK_TIMEOUT_MS = Number(process.env.TABULA_THINK_TIMEOUT_MS) || 60000;
 
 // The UI sends model ids that match the Anthropic API; map any that the
 // Agent SDK / Claude Code names differently (e.g. dated snapshots -> alias).
@@ -24,21 +31,32 @@ const MODEL_MAP = {
 };
 const resolveModel = (id) => MODEL_MAP[id] || id;
 
-async function askModel({ model, system, user }) {
+async function askModel({ model, system, user, thinking }) {
+  const think = !!thinking;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), think ? THINK_TIMEOUT_MS : MOVE_TIMEOUT_MS);
   let text = "";
-  for await (const msg of query({
-    prompt: user,
-    options: {
-      model: resolveModel(model),
-      systemPrompt: system, // a plain string replaces the default Claude Code prompt
-      allowedTools: [], // pure reasoning task - no file/bash/web tools
-      maxTurns: 1,
-      settingSources: [], // don't load project/user CLAUDE.md into a game move
-    },
-  })) {
-    if (msg.type === "result" && msg.subtype === "success") text = msg.result;
+  try {
+    for await (const msg of query({
+      prompt: user,
+      options: {
+        model: resolveModel(model),
+        systemPrompt: system, // a plain string replaces the default Claude Code prompt
+        allowedTools: [], // pure reasoning task - no file/bash/web tools
+        maxTurns: 1,
+        settingSources: [], // don't load project/user CLAUDE.md into a game move
+        // Off by default keeps moves fast and consistent; the UI can turn on
+        // extended thinking (bounded budget) for deeper, slower play.
+        maxThinkingTokens: think ? THINK_BUDGET : 0,
+        abortController: ac, // enforce the timeout so a slow move can't freeze the game
+      },
+    })) {
+      if (msg.type === "result" && msg.subtype === "success") text = msg.result;
+    }
+  } finally {
+    clearTimeout(timer);
   }
-  if (!text) throw new Error("empty response from model");
+  if (!text) throw new Error("empty or timed-out response from model");
   return text;
 }
 
@@ -54,13 +72,13 @@ function readBody(req) {
 const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/api/move") {
     try {
-      const { model, system, user } = JSON.parse((await readBody(req)) || "{}");
+      const { model, system, user, thinking } = JSON.parse((await readBody(req)) || "{}");
       if (!model || !system || !user) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "model, system and user are required" }));
         return;
       }
-      const text = await askModel({ model, system, user });
+      const text = await askModel({ model, system, user, thinking });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ text }));
     } catch (err) {

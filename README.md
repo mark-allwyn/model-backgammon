@@ -64,7 +64,9 @@ So if you are signed in to a Claude Pro or Max subscription, moves are played on
 
 Note: if `ANTHROPIC_API_KEY` is set in the shell that runs the proxy, the Agent SDK uses that API key (separate pay-as-you-go billing) instead of your subscription.
 Unset it to force subscription auth.
-If the proxy is unreachable, the app falls back to a built-in heuristic so a game still plays out end to end.
+
+To keep moves fast, the proxy disables extended thinking (a move is only a pick from a pre-scored list of legal plays) and caps each move at `TABULA_MOVE_TIMEOUT_MS` (default 12000 ms).
+If the proxy is unreachable or a move times out, the app falls back to a built-in heuristic so a game still plays out end to end without stalling.
 
 Making this provider-agnostic (Anthropic, OpenAI, Google, OpenRouter, the Vercel AI Gateway on one code path) is still a future step.
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan, including the leaderboard and rating design.
