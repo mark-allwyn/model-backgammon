@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Play, Pause, SkipForward, RotateCcw, Trophy, Brain } from "lucide-react";
+import { Play, Pause, SkipForward, RotateCcw, Trophy, Brain, Shuffle, ChevronLeft } from "lucide-react";
 
 /* ============================ ENGINE (tested) ============================ */
 const sign = (pl) => (pl === "W" ? 1 : -1);
@@ -122,10 +122,12 @@ const offCoords = (pl, i) => pl === "W"
 
 /* ============================ MODELS ============================ */
 const MODELS = [
-  { id: "claude-opus-4-8", name: "Claude Opus 4.8", tier: "Most capable - deepest strategic play" },
+  { id: "claude-opus-5-5", name: "Claude Opus 5.5", tier: "Newest Opus - deepest strategic play" },
+  { id: "claude-opus-5", name: "Claude Opus 5", tier: "Flagship reasoning" },
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", tier: "Balanced reasoning and speed" },
-  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", tier: "Fast and reliable" },
   { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", tier: "Fastest, most concise" },
+  { id: "claude-opus-4-8", name: "Claude Opus 4.8", tier: "Previous flagship" },
+  { id: "claude-fable-5-1", name: "Claude Fable 5.1", tier: "Most capable, premium tier" },
 ];
 const MODEL_NAME = (id) => (MODELS.find((m) => m.id === id) || { name: id }).name;
 
@@ -183,6 +185,18 @@ async function askModel(board, pl, dice, plays, modelId, thinking) {
     catch (e2) { return { choice: heuristicPick(plays, pl), reasoning: "(Reading the board directly - reaching for the sharpest line available.)" }; }
   }
 }
+
+/* ============================ LEADERBOARD CLIENT ============================ */
+// Fire-and-forget: recording a result must never affect the game.
+async function postResult(payload) {
+  try {
+    await fetch("/api/result", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch { /* leaderboard is optional */ }
+}
+const pct = (x) => `${Math.round((x || 0) * 100)}%`;
 
 /* ============================ THEME ============================ */
 const CSS = `
@@ -255,6 +269,39 @@ const CSS = `
 .logscroll::-webkit-scrollbar{width:8px;}
 .logscroll::-webkit-scrollbar-thumb{background:#3a2c19;border-radius:4px;}
 @media (prefers-reduced-motion: reduce){.dot.pulse,.reason .caret{animation:none;}.cube3d{transition:none;}}
+.lb{max-width:920px;margin:0 auto;}
+.lb-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px;}
+.lb-title{font-family:'Fraunces',serif;font-weight:600;font-size:30px;margin:0;color:var(--bone);}
+.lb-sub{font-size:13px;color:var(--ink-dim);margin-top:4px;max-width:560px;line-height:1.5;}
+.lb-empty{border:1px dashed #3a2c19;border-radius:14px;padding:34px 18px;text-align:center;color:var(--ink-dim);font-family:'Fraunces',serif;font-style:italic;font-size:16px;}
+.lb-empty code{font-style:normal;font-family:ui-monospace,monospace;color:var(--brass-hi);}
+.lb-tablewrap{border:1px solid #34291a;border-radius:16px;overflow-x:auto;background:linear-gradient(180deg,rgba(38,30,19,.72),rgba(20,16,11,.72));}
+.lb-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;min-width:520px;}
+.lb-table th{text-align:left;font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint);font-weight:700;padding:13px 16px;border-bottom:1px solid #29200f;background:rgba(0,0,0,.2);}
+.lb-table td{padding:13px 16px;border-bottom:1px solid rgba(255,255,255,.04);font-size:14.5px;color:var(--ink);}
+.lb-table tr:last-child td{border-bottom:0;}
+.lb-table .n{text-align:right;}
+.lb-table .r{width:44px;color:var(--ink-faint);font-weight:700;}
+.lb-table .mname{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--bone);}
+.lb-table .strong{color:var(--brass-hi);font-weight:700;}
+.lb-table .muted{color:var(--ink-faint);font-size:12px;}
+.lb-table tr.prov{opacity:.6;}
+.tag{display:inline-block;margin-left:9px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:700;color:var(--ink-faint);border:1px solid #3a2c19;border-radius:999px;padding:2px 8px;vertical-align:1px;}
+.tag.gold{color:#2a1d08;background:var(--brass);border-color:var(--brass-hi);}
+.lb-recent{margin-top:26px;}
+.lb-rtitle{font-weight:800;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 10px;}
+.lb-row{display:flex;align-items:center;gap:10px;padding:9px 6px;border-bottom:1px solid rgba(255,255,255,.04);font-size:14px;}
+.lb-row .lb-win{font-weight:700;color:var(--bone);}
+.lb-row .lb-beat{color:var(--ink-faint);font-size:12px;font-style:italic;font-family:'Fraunces',serif;}
+.lb-row .lb-lose{color:var(--ink-dim);}
+.lb-row .lb-when{margin-left:auto;color:var(--ink-faint);font-size:12px;}
+.lb-table tr.click{cursor:pointer;transition:background .12s;}
+.lb-table tr.click:hover td{background:rgba(201,163,90,.08);}
+.lb-back{display:inline-flex;align-items:center;gap:5px;background:none;border:0;color:var(--brass);font-family:inherit;font-weight:600;font-size:13px;cursor:pointer;padding:0;}
+.lb-back:hover{color:var(--brass-hi);}
+.lb-row .res{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:6px;font-size:11px;font-weight:800;}
+.lb-row .res.win{background:rgba(120,190,120,.18);color:#9fd39f;}
+.lb-row .res.loss{background:rgba(200,110,110,.16);color:#d79a9a;}
 `;
 
 /* ============================ SVG PIECES ============================ */
@@ -421,7 +468,7 @@ function TypeReason({ text, empty, speed }) {
 }
 
 /* ============================ PANEL ============================ */
-function Panel({ side, model, setModel, board, dice, isTurn, thinking, reasoning, disabled, speed }) {
+function Panel({ side, model, setModel, exclude, board, dice, isTurn, thinking, reasoning, disabled, speed }) {
   const isW = side === "W";
   const meta = MODELS.find((m) => m.id === model) || MODELS[0];
   const chip = isW
@@ -437,7 +484,7 @@ function Panel({ side, model, setModel, board, dice, isTurn, thinking, reasoning
       <div className="selrow">
         <label>Model</label>
         <select className="sel" value={model} disabled={disabled} onChange={(e) => setModel(e.target.value)}>
-          {MODELS.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+          {MODELS.filter((m) => m.id !== exclude).map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
         </select>
         <div className="persona-desc">{meta.tier}</div>
       </div>
@@ -456,6 +503,152 @@ function Panel({ side, model, setModel, board, dice, isTurn, thinking, reasoning
   );
 }
 
+/* ============================ LEADERBOARD ============================ */
+function ModelHistory({ model, onBack }) {
+  const [d, setD] = useState(null);
+  const [state, setState] = useState("loading");
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      setState("loading");
+      try {
+        const r = await fetch(`/api/head-to-head?model=${encodeURIComponent(model)}`).then((x) => x.json());
+        if (live) { setD(r); setState("ok"); }
+      } catch { if (live) setState("error"); }
+    })();
+    return () => { live = false; };
+  }, [model]);
+
+  const opps = (d && d.opponents) || [];
+  const recent = (d && d.recent) || [];
+  return (
+    <div className="lb">
+      <div className="lb-head">
+        <div>
+          <button className="lb-back" onClick={onBack}><ChevronLeft size={15} />All models</button>
+          <h2 className="lb-title" style={{ marginTop: 8 }}>{MODEL_NAME(model)}</h2>
+          {d && d.found && <div className="lb-sub">Rating {d.rating} ±{d.rd} · {d.wins}-{d.losses} across {d.games} games{d.provisional ? " · provisional" : ""}{d.gammons ? ` · ${d.gammons} gammons` : ""}</div>}
+        </div>
+      </div>
+      {state === "error" && <div className="lb-empty">Could not load this model's history.</div>}
+      {state === "ok" && opps.length === 0 && <div className="lb-empty">No games recorded for this model yet.</div>}
+      {opps.length > 0 && (
+        <div className="lb-tablewrap">
+          <table className="lb-table">
+            <thead><tr><th>Opponent</th><th className="n">Games</th><th className="n">W&nbsp;-&nbsp;L</th><th className="n">Win %</th></tr></thead>
+            <tbody>
+              {opps.map((o) => (
+                <tr key={o.opponent}>
+                  <td className="mname">{MODEL_NAME(o.opponent)}</td>
+                  <td className="n">{o.games}</td>
+                  <td className="n">{o.wins}&nbsp;-&nbsp;{o.losses}</td>
+                  <td className="n strong">{pct(o.games ? o.wins / o.games : 0)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {recent.length > 0 && (
+        <div className="lb-recent">
+          <h3 className="lb-rtitle">Recent games</h3>
+          {recent.map((m, i) => {
+            const won = m.winner_model === model;
+            const other = won ? m.loser_model : m.winner_model;
+            return (
+              <div className="lb-row" key={i}>
+                <span className={`res ${won ? "win" : "loss"}`}>{won ? "W" : "L"}</span>
+                <span className="lb-beat">vs</span>
+                <span className="lb-lose">{MODEL_NAME(other)}</span>
+                {m.is_gammon ? <span className="tag gold">gammon</span> : null}
+                <span className="lb-when">{new Date(m.played_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Leaderboard() {
+  const [data, setData] = useState({ rows: [] });
+  const [matches, setMatches] = useState([]);
+  const [state, setState] = useState("loading"); // loading | ok | error
+  const [selected, setSelected] = useState(null);
+
+  const load = useCallback(async () => {
+    setState("loading");
+    try {
+      const [lb, mt] = await Promise.all([
+        fetch("/api/leaderboard").then((r) => r.json()),
+        fetch("/api/matches?limit=12").then((r) => r.json()),
+      ]);
+      setData(lb || { rows: [] });
+      setMatches((mt && mt.matches) || []);
+      setState("ok");
+    } catch { setState("error"); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  if (selected) return <ModelHistory model={selected} onBack={() => { setSelected(null); load(); }} />;
+
+  const rows = data.rows || [];
+  return (
+    <div className="lb">
+      <div className="lb-head">
+        <div>
+          <h2 className="lb-title">Leaderboard</h2>
+          <div className="lb-sub">Glicko-2 rating from every completed game - higher is stronger. The ± is how uncertain the rating still is (smaller is more settled); models still finding their level are marked provisional. Click a model to see its history.</div>
+        </div>
+        <button className="btn" onClick={load}><RotateCcw size={15} />Refresh</button>
+      </div>
+
+      {state === "error" && <div className="lb-empty">Could not reach the leaderboard. Is the model proxy running (<code>npm run server</code>)?</div>}
+      {state !== "error" && rows.length === 0 && <div className="lb-empty">No games recorded yet. Play a match in the Arena and the result lands here.</div>}
+
+      {rows.length > 0 && (
+        <div className="lb-tablewrap">
+          <table className="lb-table">
+            <thead>
+              <tr><th className="r">#</th><th>Model</th><th className="n">Rating</th><th className="n">Games</th><th className="n">W&nbsp;-&nbsp;L</th><th className="n">Win %</th><th className="n">Gammons</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={r.model} className={`click${r.provisional ? " prov" : ""}`} onClick={() => setSelected(r.model)} title="View history">
+                  <td className="r">{i + 1}</td>
+                  <td className="mname">{MODEL_NAME(r.model)}{r.provisional && <span className="tag">provisional</span>}</td>
+                  <td className="n"><span className="strong">{r.rating}</span> <span className="muted">±{r.rd}</span></td>
+                  <td className="n">{r.games}</td>
+                  <td className="n">{r.wins}&nbsp;-&nbsp;{r.losses}</td>
+                  <td className="n">{pct(r.winPct)}</td>
+                  <td className="n">{r.gammons}{r.gammons ? <span className="muted"> ({pct(r.gammonPct)})</span> : null}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {matches.length > 0 && (
+        <div className="lb-recent">
+          <h3 className="lb-rtitle">Recent games</h3>
+          {matches.map((m, i) => (
+            <div className="lb-row" key={i}>
+              <span className="chip" style={{ background: "radial-gradient(circle at 35% 30%, #faf3e3, #c3ac7f)" }} />
+              <span className="lb-win">{MODEL_NAME(m.winner_model)}</span>
+              <span className="lb-beat">beat</span>
+              <span className="lb-lose">{MODEL_NAME(m.loser_model)}</span>
+              {m.is_gammon ? <span className="tag gold">gammon</span> : null}
+              <span className="lb-when">{new Date(m.played_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ============================ MAIN ============================ */
 export default function App() {
   const [board, setBoard] = useState(initialBoard);
@@ -463,7 +656,7 @@ export default function App() {
   const [dice, setDice] = useState({ W: null, B: null });
   const [phase, setPhase] = useState("idle");
   const [running, setRunning] = useState(false);
-  const [models, setModels] = useState({ W: "claude-opus-4-8", B: "claude-sonnet-5" });
+  const [models, setModels] = useState({ W: "claude-opus-5", B: "claude-sonnet-5" });
   const [reason, setReason] = useState({ W: "", B: "" });
   const [thinkingSide, setThinkingSide] = useState(null);
   const [highlight, setHighlight] = useState(null);
@@ -472,6 +665,7 @@ export default function App() {
   const [speed, setSpeed] = useState("fast");
   const [thinking, setThinking] = useState(false);
   const [flyerW, setFlyerW] = useState(true);
+  const [view, setView] = useState("arena"); // "arena" | "leaderboard"
 
   const boardRef = useRef(board), turnRef = useRef(turn), runningRef = useRef(false);
   const modelsRef = useRef(models), speedRef = useRef(speed), runId = useRef(0), moveNo = useRef(0);
@@ -565,7 +759,20 @@ export default function App() {
     setLog((L) => [...L, { n: moveNo.current, color: pl, mv: notation(chosen.moves), dice: `${d[0]}-${d[1]}` }].slice(-60));
 
     const w = winner(boardRef.current);
-    if (w) { setWin(w); setPhase("over"); runningRef.current = false; setRunning(false); return; }
+    if (w) {
+      setWin(w); setPhase("over"); runningRef.current = false; setRunning(false);
+      const b = boardRef.current, lo = opp(w);
+      postResult({
+        winner_model: modelsRef.current[w],
+        loser_model: modelsRef.current[lo],
+        winner_side: w,
+        is_gammon: b.off[lo] === 0,
+        margin_pips: pipCount(b, lo),
+        speed: speedRef.current,
+        thinking: thinkingRef.current,
+      });
+      return;
+    }
     turnRef.current = opp(pl); setTurn(opp(pl));
   }
 
@@ -575,6 +782,16 @@ export default function App() {
   const start = () => { if (win) resetGame(); const id = ++runId.current; runningRef.current = true; setRunning(true); gameLoop(id); };
   const pause = () => { runningRef.current = false; setRunning(false); };
   const step = async () => { if (running || win) return; const id = ++runId.current; await runTurn(id); };
+  const suggestMatch = async () => {
+    try {
+      const r = await fetch("/api/next-match", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ models: MODELS.map((m) => m.id) }),
+      });
+      const j = await r.json();
+      if (j && j.white && j.black) { resetGame(); setModels({ W: j.white, B: j.black }); }
+    } catch { /* matchmaker optional */ }
+  };
 
   const busy = running || phase === "thinking" || phase === "animating" || phase === "rolling";
   const winName = win ? MODEL_NAME(models[win]) : "";
@@ -590,41 +807,50 @@ export default function App() {
             <span className="sub">an arena where two minds meet over the oldest game</span>
           </div>
           <div className="controls">
-            <div className="speed" role="group" aria-label="Speed">
-              {["slow", "normal", "fast"].map((s) => <button key={s} className={speed === s ? "on" : ""} onClick={() => setSpeed(s)}>{s[0].toUpperCase() + s.slice(1)}</button>)}
+            <div className="speed" role="group" aria-label="View">
+              <button className={view === "arena" ? "on" : ""} onClick={() => setView("arena")}>Arena</button>
+              <button className={view === "leaderboard" ? "on" : ""} onClick={() => setView("leaderboard")}>Leaderboard</button>
             </div>
-            <button className={`btn${thinking ? " primary" : ""}`} onClick={() => setThinking((t) => !t)} aria-pressed={thinking} title={thinking ? "Extended thinking on - deeper play, slower moves" : "Extended thinking off - fast moves"}><Brain size={16} />Thinking</button>
-            <button className="btn" onClick={step} disabled={busy || !!win}><SkipForward size={16} />Step</button>
-            {running
-              ? <button className="btn" onClick={pause}><Pause size={16} />Pause</button>
-              : <button className="btn primary" onClick={start}>{win ? <><RotateCcw size={16} />Rematch</> : <><Play size={16} />{phase === "idle" ? "Start match" : "Resume"}</>}</button>}
-            <button className="btn" onClick={resetGame}><RotateCcw size={16} />New game</button>
+            {view === "arena" && <>
+              <div className="speed" role="group" aria-label="Speed">
+                {["slow", "normal", "fast"].map((s) => <button key={s} className={speed === s ? "on" : ""} onClick={() => setSpeed(s)}>{s[0].toUpperCase() + s.slice(1)}</button>)}
+              </div>
+              <button className={`btn${thinking ? " primary" : ""}`} onClick={() => setThinking((t) => !t)} aria-pressed={thinking} title={thinking ? "Extended thinking on - deeper play, slower moves" : "Extended thinking off - fast moves"}><Brain size={16} />Thinking</button>
+              <button className="btn" onClick={suggestMatch} disabled={busy} title="Pick the most useful next matchup"><Shuffle size={16} />Suggest match</button>
+              <button className="btn" onClick={step} disabled={busy || !!win}><SkipForward size={16} />Step</button>
+              {running
+                ? <button className="btn" onClick={pause}><Pause size={16} />Pause</button>
+                : <button className="btn primary" onClick={start}>{win ? <><RotateCcw size={16} />Rematch</> : <><Play size={16} />{phase === "idle" ? "Start match" : "Resume"}</>}</button>}
+              <button className="btn" onClick={resetGame}><RotateCcw size={16} />New game</button>
+            </>}
           </div>
         </div>
 
-        {win && <div className="banner"><Trophy size={22} />{winName} wins{gammon ? " a gammon" : ""} · {win === "W" ? "Ivory" : "Ebony"}</div>}
+        {view === "leaderboard" ? <Leaderboard /> : <>
+          {win && <div className="banner"><Trophy size={22} />{winName} wins{gammon ? " a gammon" : ""} · {win === "W" ? "Ivory" : "Ebony"}</div>}
 
-        <div className="grid">
-          <Panel side="W" model={models.W} setModel={(v) => setModels((p) => ({ ...p, W: v }))} board={board} dice={dice.W} isTurn={turn === "W" && !win} thinking={thinkingSide === "W"} reasoning={reason.W} disabled={busy} speed={speed} />
-          <div className="boardwrap"><Board board={board} highlight={highlight} flyerRef={flyerRef} flyerW={flyerW} /></div>
-          <Panel side="B" model={models.B} setModel={(v) => setModels((p) => ({ ...p, B: v }))} board={board} dice={dice.B} isTurn={turn === "B" && !win} thinking={thinkingSide === "B"} reasoning={reason.B} disabled={busy} speed={speed} />
-        </div>
-
-        <div className="log">
-          <h3>Move history</h3>
-          <div className="logscroll" ref={(el) => { if (el) el.scrollTop = el.scrollHeight; }}>
-            {log.length === 0
-              ? <div style={{ padding: "18px 12px", color: "var(--ink-faint)", fontStyle: "italic", fontFamily: "'Fraunces',serif" }}>Press Start to watch the two models play. Every move is a real, legal backgammon play chosen by the selected model.</div>
-              : log.map((row) => (
-                <div className="logrow" key={row.n}>
-                  <span className="n">{row.n}.</span>
-                  <span className="chip" style={row.color === "W" ? { background: "radial-gradient(circle at 35% 30%, #faf3e3, #c3ac7f)" } : { background: "radial-gradient(circle at 35% 30%, #4f4132, #120c06)" }} />
-                  <span className="mv">{row.mv}</span>
-                  <span className="dc">{row.dice}</span>
-                </div>
-              ))}
+          <div className="grid">
+            <Panel side="W" model={models.W} setModel={(v) => setModels((p) => ({ ...p, W: v }))} exclude={models.B} board={board} dice={dice.W} isTurn={turn === "W" && !win} thinking={thinkingSide === "W"} reasoning={reason.W} disabled={busy} speed={speed} />
+            <div className="boardwrap"><Board board={board} highlight={highlight} flyerRef={flyerRef} flyerW={flyerW} /></div>
+            <Panel side="B" model={models.B} setModel={(v) => setModels((p) => ({ ...p, B: v }))} exclude={models.W} board={board} dice={dice.B} isTurn={turn === "B" && !win} thinking={thinkingSide === "B"} reasoning={reason.B} disabled={busy} speed={speed} />
           </div>
-        </div>
+
+          <div className="log">
+            <h3>Move history</h3>
+            <div className="logscroll" ref={(el) => { if (el) el.scrollTop = el.scrollHeight; }}>
+              {log.length === 0
+                ? <div style={{ padding: "18px 12px", color: "var(--ink-faint)", fontStyle: "italic", fontFamily: "'Fraunces',serif" }}>Press Start to watch the two models play. Every move is a real, legal backgammon play chosen by the selected model.</div>
+                : log.map((row) => (
+                  <div className="logrow" key={row.n}>
+                    <span className="n">{row.n}.</span>
+                    <span className="chip" style={row.color === "W" ? { background: "radial-gradient(circle at 35% 30%, #faf3e3, #c3ac7f)" } : { background: "radial-gradient(circle at 35% 30%, #4f4132, #120c06)" }} />
+                    <span className="mv">{row.mv}</span>
+                    <span className="dc">{row.dice}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        </>}
       </div>
     </div>
   );

@@ -10,6 +10,9 @@
 // key instead of your subscription. Unset it to force subscription auth.
 
 import { createServer } from "node:http";
+import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 const PORT = Number(process.env.TABULA_PORT) || 8787;
@@ -30,6 +33,250 @@ const MODEL_MAP = {
   "claude-haiku-4-5-20251001": "claude-haiku-4-5",
 };
 const resolveModel = (id) => MODEL_MAP[id] || id;
+
+/* ---------------- Leaderboard storage (SQLite) ----------------
+ * Uses Node's built-in node:sqlite (no native build). If it is unavailable
+ * (older Node) or the file cannot be opened, the server runs without a
+ * leaderboard: results are not saved and the endpoints return empty. */
+const DB_PATH = process.env.TABULA_DB ||
+  join(dirname(fileURLToPath(import.meta.url)), "..", "data", "tabula.db");
+// Glicko-2 rating settings. Each model has a rating, a rating deviation (RD, the
+// +/- uncertainty) and a volatility. A model is "established" once its RD drops
+// below RD_ESTABLISHED; until then it shows as provisional.
+const GK = { r: 1500, rd: 350, vol: 0.06, tau: 0.5, scale: 173.7178, eps: 1e-6 };
+const RD_ESTABLISHED = Number(process.env.TABULA_RD_ESTABLISHED) || 110;
+
+let db = null;
+let DatabaseSync = null;
+try { ({ DatabaseSync } = await import("node:sqlite")); } catch { /* Node < 22.5 */ }
+try {
+  if (!DatabaseSync) throw new Error("node:sqlite unavailable");
+  mkdirSync(dirname(DB_PATH), { recursive: true });
+  db = new DatabaseSync(DB_PATH);
+  db.exec(`CREATE TABLE IF NOT EXISTS matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    played_at TEXT NOT NULL,
+    winner_model TEXT NOT NULL,
+    loser_model TEXT NOT NULL,
+    winner_side TEXT,
+    is_gammon INTEGER NOT NULL DEFAULT 0,
+    margin_pips INTEGER,
+    speed TEXT,
+    thinking INTEGER NOT NULL DEFAULT 0
+  )`);
+} catch (err) {
+  console.log("NOTE: leaderboard database unavailable (" + (err && err.message) + "); results will not be saved.");
+  db = null;
+}
+
+function recordResult(r) {
+  if (!db) return;
+  db.prepare(
+    `INSERT INTO matches (played_at, winner_model, loser_model, winner_side, is_gammon, margin_pips, speed, thinking)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    new Date().toISOString(),
+    String(r.winner_model),
+    String(r.loser_model),
+    r.winner_side ? String(r.winner_side) : null,
+    r.is_gammon ? 1 : 0,
+    Number.isFinite(r.margin_pips) ? Math.round(r.margin_pips) : null,
+    r.speed ? String(r.speed) : null,
+    r.thinking ? 1 : 0,
+  );
+}
+
+// One Glicko-2 rating-period update for a single model.
+// `results` is a list of { r, rd, s } for that model's games this period, where
+// r/rd are the OPPONENT's pre-period rating/deviation and s is 1 (win) or 0 (loss).
+// With no games, the model's RD widens (uncertainty grows while it sits idle).
+function glicko2Update(rating, rd, vol, results) {
+  const S = GK.scale;
+  const phi0 = rd / S;
+  if (results.length === 0) {
+    const phiStar = Math.sqrt(phi0 * phi0 + vol * vol);
+    return { rating, rd: Math.min(GK.rd, phiStar * S), vol };
+  }
+  const mu = (rating - GK.r) / S;
+  const g = (p) => 1 / Math.sqrt(1 + (3 * p * p) / (Math.PI * Math.PI));
+  const expected = (muj, phij) => 1 / (1 + Math.exp(-g(phij) * (mu - muj)));
+
+  let vInv = 0, deltaSum = 0;
+  for (const res of results) {
+    const muj = (res.r - GK.r) / S;
+    const phij = res.rd / S;
+    const gj = g(phij);
+    const ej = expected(muj, phij);
+    vInv += gj * gj * ej * (1 - ej);
+    deltaSum += gj * (res.s - ej);
+  }
+  const v = 1 / vInv;
+  const delta = v * deltaSum;
+
+  // Solve for the new volatility (Illinois algorithm, per Glickman's paper).
+  const a = Math.log(vol * vol);
+  const f = (x) => {
+    const ex = Math.exp(x);
+    const d2 = delta * delta;
+    const num = ex * (d2 - phi0 * phi0 - v - ex);
+    const den = 2 * Math.pow(phi0 * phi0 + v + ex, 2);
+    return num / den - (x - a) / (GK.tau * GK.tau);
+  };
+  let A = a, B;
+  if (delta * delta > phi0 * phi0 + v) {
+    B = Math.log(delta * delta - phi0 * phi0 - v);
+  } else {
+    let k = 1;
+    while (f(a - k * GK.tau) < 0) k++;
+    B = a - k * GK.tau;
+  }
+  let fA = f(A), fB = f(B), iter = 0;
+  while (Math.abs(B - A) > GK.eps && iter < 100) {
+    const C = A + ((A - B) * fA) / (fB - fA);
+    const fC = f(C);
+    if (fC * fB <= 0) { A = B; fA = fB; } else { fA = fA / 2; }
+    B = C; fB = fC; iter++;
+  }
+  const newVol = Math.exp(A / 2);
+
+  const phiStar = Math.sqrt(phi0 * phi0 + newVol * newVol);
+  const newPhi = 1 / Math.sqrt(1 / (phiStar * phiStar) + 1 / v);
+  const newMu = mu + newPhi * newPhi * deltaSum;
+  return { rating: newMu * S + GK.r, rd: newPhi * S, vol: newVol };
+}
+
+// Replay the whole match log to build per-model tallies and Glicko-2 ratings.
+// Games are grouped into rating periods by calendar day (UTC): within a period,
+// every model is rated against its opponents' ratings as they stood at the start
+// of that period, which is how Glicko-2 is meant to be applied.
+function computeStats() {
+  const map = new Map();
+  const get = (m) => {
+    if (!map.has(m)) map.set(m, {
+      model: m, rating: GK.r, rd: GK.rd, vol: GK.vol,
+      games: 0, wins: 0, losses: 0, gammons: 0, gammonsAgainst: 0, opp: new Map(),
+    });
+    return map.get(m);
+  };
+  if (!db) return map;
+  const matches = db.prepare(
+    `SELECT winner_model, loser_model, is_gammon, played_at FROM matches ORDER BY played_at ASC, id ASC`,
+  ).all();
+
+  // Group into periods (one per UTC day that has games), preserving order.
+  const periods = new Map();
+  for (const mt of matches) {
+    const day = String(mt.played_at || "").slice(0, 10) || "unknown";
+    if (!periods.has(day)) periods.set(day, []);
+    periods.get(day).push(mt);
+  }
+
+  for (const games of periods.values()) {
+    // Ensure every model in this period exists, then snapshot pre-period ratings.
+    for (const mt of games) { get(mt.winner_model); get(mt.loser_model); }
+    const pre = new Map();
+    for (const [m, s] of map) pre.set(m, { rating: s.rating, rd: s.rd });
+
+    // Collect this period's results per model, and update plain tallies now.
+    const played = new Map(); // model -> [{ r, rd, s }]
+    const add = (m, r, rd, s) => { if (!played.has(m)) played.set(m, []); played.get(m).push({ r, rd, s }); };
+    for (const mt of games) {
+      const w = get(mt.winner_model), l = get(mt.loser_model);
+      const pw = pre.get(mt.winner_model), pl = pre.get(mt.loser_model);
+      add(w.model, pl.rating, pl.rd, 1);
+      add(l.model, pw.rating, pw.rd, 0);
+      w.games++; l.games++; w.wins++; l.losses++;
+      if (mt.is_gammon) { w.gammons++; l.gammonsAgainst++; }
+      const wh = w.opp.get(l.model) || { opponent: l.model, games: 0, wins: 0, losses: 0, gammonsFor: 0, gammonsAgainst: 0 };
+      wh.games++; wh.wins++; if (mt.is_gammon) wh.gammonsFor++; w.opp.set(l.model, wh);
+      const lh = l.opp.get(w.model) || { opponent: w.model, games: 0, wins: 0, losses: 0, gammonsFor: 0, gammonsAgainst: 0 };
+      lh.games++; lh.losses++; if (mt.is_gammon) lh.gammonsAgainst++; l.opp.set(w.model, lh);
+    }
+
+    // Apply Glicko-2 to every model: those who played from their results, the
+    // rest get the idle RD widening. Opponents come from the pre-period snapshot.
+    for (const [m, s] of map) {
+      const p = pre.get(m) || { rating: s.rating, rd: s.rd };
+      const upd = glicko2Update(p.rating, p.rd, s.vol, played.get(m) || []);
+      s.rating = upd.rating; s.rd = upd.rd; s.vol = upd.vol;
+    }
+  }
+  return map;
+}
+
+function rowOf(s) {
+  return {
+    model: s.model, rating: Math.round(s.rating), rd: Math.round(s.rd),
+    games: s.games, wins: s.wins, losses: s.losses,
+    winPct: s.games ? s.wins / s.games : 0,
+    gammons: s.gammons, gammonPct: s.wins ? s.gammons / s.wins : 0,
+    provisional: s.rd > RD_ESTABLISHED,
+  };
+}
+
+function leaderboard() {
+  const rows = [...computeStats().values()].map(rowOf);
+  // Established models (tight RD) first by rating; provisional ones after, also by rating.
+  rows.sort((a, b) =>
+    (a.provisional - b.provisional) || (b.rating - a.rating) || (a.rd - b.rd) || a.model.localeCompare(b.model));
+  return { rdEstablished: RD_ESTABLISHED, rows };
+}
+
+function headToHead(model) {
+  const s = computeStats().get(model);
+  const recent = db
+    ? db.prepare(
+        `SELECT played_at, winner_model, loser_model, is_gammon, margin_pips
+         FROM matches WHERE winner_model = ? OR loser_model = ? ORDER BY id DESC LIMIT 15`,
+      ).all(model, model)
+    : [];
+  if (!s) return { model, found: false, rating: GK.r, rd: GK.rd, games: 0, wins: 0, losses: 0, provisional: true, opponents: [], recent };
+  const opponents = [...s.opp.values()].sort((a, b) => b.games - a.games || a.opponent.localeCompare(b.opponent));
+  return {
+    model, found: true, rating: Math.round(s.rating), rd: Math.round(s.rd),
+    games: s.games, wins: s.wins, losses: s.losses,
+    gammons: s.gammons, gammonsAgainst: s.gammonsAgainst,
+    provisional: s.rd > RD_ESTABLISHED, opponents, recent,
+  };
+}
+
+// Suggest the most useful next matchup among a pool of models: favour models with
+// high uncertainty (big RD, need games) and pairings close in rating (informative).
+function nextMatch(candidates) {
+  const pool = [...new Set((candidates || []).filter(Boolean))];
+  if (pool.length < 2) return null;
+  const stats = computeStats();
+  const info = pool.map((id) => {
+    const s = stats.get(id);
+    return { id, rating: s ? s.rating : GK.r, rd: s ? s.rd : GK.rd, games: s ? s.games : 0 };
+  });
+  let best = null, bestScore = -Infinity;
+  for (let i = 0; i < info.length; i++) {
+    for (let j = i + 1; j < info.length; j++) {
+      const a = info[i], b = info[j];
+      const uncertainty = (a.rd + b.rd) / 200;                                  // ~0..3.5, higher = needs games
+      const closeness = 1 - Math.min(1, Math.abs(a.rating - b.rating) / 400);   // 1 = equal, 0 = >=400 apart
+      const score = uncertainty + closeness * 3 + Math.random() * 0.6;
+      if (score > bestScore) { bestScore = score; best = [a, b]; }
+    }
+  }
+  if (!best) return null;
+  const [x, y] = Math.random() < 0.5 ? best : [best[1], best[0]]; // randomise sides
+  return {
+    white: x.id, black: y.id,
+    whiteRating: Math.round(x.rating), blackRating: Math.round(y.rating),
+    whiteRd: Math.round(x.rd), blackRd: Math.round(y.rd),
+  };
+}
+
+function recentMatches(limit) {
+  if (!db) return [];
+  const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  return db.prepare(
+    `SELECT played_at, winner_model, loser_model, winner_side, is_gammon, margin_pips
+     FROM matches ORDER BY id DESC LIMIT ?`,
+  ).all(n);
+}
 
 async function askModel({ model, system, user, thinking }) {
   const think = !!thinking;
@@ -70,25 +317,45 @@ function readBody(req) {
 }
 
 const server = createServer(async (req, res) => {
-  if (req.method === "POST" && req.url === "/api/move") {
-    try {
+  const url = new URL(req.url, "http://localhost");
+  const send = (code, obj) => {
+    res.writeHead(code, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(obj));
+  };
+  try {
+    if (req.method === "POST" && url.pathname === "/api/move") {
       const { model, system, user, thinking } = JSON.parse((await readBody(req)) || "{}");
-      if (!model || !system || !user) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "model, system and user are required" }));
-        return;
-      }
+      if (!model || !system || !user) return send(400, { error: "model, system and user are required" });
       const text = await askModel({ model, system, user, thinking });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ text }));
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String(err && err.message ? err.message : err) }));
+      return send(200, { text });
     }
-    return;
+    if (req.method === "POST" && url.pathname === "/api/result") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (!body.winner_model || !body.loser_model) return send(400, { error: "winner_model and loser_model are required" });
+      recordResult(body);
+      return send(200, { ok: true, saved: !!db });
+    }
+    if (req.method === "GET" && url.pathname === "/api/leaderboard") {
+      return send(200, leaderboard());
+    }
+    if (req.method === "GET" && url.pathname === "/api/matches") {
+      return send(200, { matches: recentMatches(url.searchParams.get("limit")) });
+    }
+    if (req.method === "GET" && url.pathname === "/api/head-to-head") {
+      const model = url.searchParams.get("model");
+      if (!model) return send(400, { error: "model is required" });
+      return send(200, headToHead(model));
+    }
+    if (req.method === "POST" && url.pathname === "/api/next-match") {
+      const { models } = JSON.parse((await readBody(req)) || "{}");
+      const pick = nextMatch(models);
+      if (!pick) return send(400, { error: "need at least two models" });
+      return send(200, pick);
+    }
+    return send(404, { error: "not found" });
+  } catch (err) {
+    return send(500, { error: String(err && err.message ? err.message : err) });
   }
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "not found" }));
 });
 
 server.listen(PORT, () => {

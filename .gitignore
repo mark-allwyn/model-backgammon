@@ -16,3 +16,6 @@ npm-debug.log*
 # local env
 .env
 .env.local
+
+# leaderboard database (local runtime data)
+data/
