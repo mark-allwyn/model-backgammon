@@ -124,6 +124,7 @@ const offCoords = (pl, i) => pl === "W"
 const MODELS = [
   { id: "claude-opus-5-5", name: "Claude Opus 5.5", tier: "Newest Opus - deepest strategic play" },
   { id: "claude-opus-5", name: "Claude Opus 5", tier: "Flagship reasoning" },
+  { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", tier: "Newest Sonnet - faster and cheaper" },
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", tier: "Balanced reasoning and speed" },
   { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", tier: "Fastest, most concise" },
   { id: "claude-opus-4-8", name: "Claude Opus 4.8", tier: "Previous flagship" },
@@ -132,6 +133,19 @@ const MODELS = [
 const MODEL_NAME = (id) => (MODELS.find((m) => m.id === id) || { name: id }).name;
 
 /* ============================ MODEL CALL ============================ */
+// Full board from the mover's perspective: points renumbered so 1 is the mover's
+// ace point (about to bear off) and 24 is farthest; y = your checkers, o = opponent's.
+function buildBoardText(board, pl) {
+  const s = sign(pl), rows = [];
+  for (let d = 1; d <= 24; d++) {
+    const p = pl === "W" ? d : 25 - d;
+    const v = board.points[p];
+    if (v) rows.push(`${d}:${Math.abs(v)}${s * v > 0 ? "y" : "o"}`);
+  }
+  return `Board (your point numbers; 1 = your ace point, 24 = farthest; y = yours, o = opponent):
+${rows.join("  ") || "(empty)"}
+Bar - you: ${board.bar[pl]}, opponent: ${board.bar[opp(pl)]}. Borne off - you: ${board.off[pl]}, opponent: ${board.off[opp(pl)]}.`;
+}
 function buildPrompt(board, pl, dice, plays) {
   const isD = dice[0] === dice[1];
   const lines = plays.map((p, i) => {
@@ -143,22 +157,34 @@ Your pip count: ${pipCount(board, pl)} (lower is better, race to 0). Opponent pi
 Your checkers on bar: ${board.bar[pl]}. Opponent on bar: ${board.bar[opp(pl)]}.
 Opponent blots (vulnerable) at points: ${blotPoints(board, opp(pl)).join(", ") || "none"}.
 
+${buildBoardText(board, pl)}
+
 Legal plays:
 ${lines}
 
 Choose the best play index for your persona. Respond with ONLY JSON: {"choice": <index>, "reasoning": "<one sentence, max 28 words, in your persona's voice>"}.`;
 }
+function heuristicScore(play, pl) {
+  return play.moves.filter((m) => m.hit).length * 1000 - pipCount(play.board, pl) - blots(play.board, pl) * 30;
+}
 function heuristicPick(plays, pl) {
   let best = 0, bs = -1e9;
-  plays.forEach((p, i) => {
-    const s = p.moves.filter((m) => m.hit).length * 1000 - pipCount(p.board, pl) - blots(p.board, pl) * 30;
-    if (s > bs) { bs = s; best = i; }
-  });
+  plays.forEach((p, i) => { const s = heuristicScore(p, pl); if (s > bs) { bs = s; best = i; } });
   return best;
 }
+// Score every legal play with the engine heuristic; used to grade a model's pick
+// (1 = it chose the engine-best play, 0 = the worst) independent of dice luck.
+function heuristicEval(plays, pl) {
+  const scores = plays.map((p) => heuristicScore(p, pl));
+  let best = 0, worst = 0;
+  for (let i = 1; i < scores.length; i++) { if (scores[i] > scores[best]) best = i; if (scores[i] < scores[worst]) worst = i; }
+  return { scores, best, worst };
+}
+const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
 async function callClaude(model, system, userContent, thinking) {
   // Calls the local proxy (server/index.mjs), which runs the move on your
   // Claude subscription via the Agent SDK. See vite.config.js for the /api proxy.
+  const t0 = nowMs();
   const res = await fetch("/api/move", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model, system, user: userContent, thinking: !!thinking }),
@@ -167,7 +193,8 @@ async function callClaude(model, system, userContent, thinking) {
   if (!res.ok || data.error) throw new Error(data.error || ("http " + res.status));
   let txt = (data.text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
   const m = txt.match(/\{[\s\S]*\}/);
-  return JSON.parse(m ? m[0] : txt);
+  const obj = JSON.parse(m ? m[0] : txt);
+  return { obj, metrics: { latencyMs: Math.round(nowMs() - t0), ...(data.metrics || {}) } };
 }
 async function askModel(board, pl, dice, plays, modelId, thinking) {
   const colorName = pl === "W" ? "White (ivory)" : "Black (ebony)";
@@ -179,10 +206,18 @@ async function askModel(board, pl, dice, plays, modelId, thinking) {
     const reasoning = typeof obj.reasoning === "string" && obj.reasoning.trim() ? obj.reasoning.trim() : "Playing the strongest line I see.";
     return { choice, reasoning };
   };
-  try { return parse(await callClaude(modelId, system, user, thinking)); }
-  catch (e1) {
-    try { return parse(await callClaude("claude-sonnet-4-6", system, user, thinking)); }
-    catch (e2) { return { choice: heuristicPick(plays, pl), reasoning: "(Reading the board directly - reaching for the sharpest line available.)" }; }
+  // One attempt on the chosen model, then the engine heuristic. We deliberately do
+  // not retry on a different model, so a model is never credited or blamed for
+  // another model's move - it just registers as a fallback in the metrics.
+  try {
+    const { obj, metrics } = await callClaude(modelId, system, user, thinking);
+    return { ...parse(obj), metrics: { ...metrics, outcome: "model" } };
+  } catch {
+    return {
+      choice: heuristicPick(plays, pl),
+      reasoning: "(Reading the board directly - reaching for the sharpest line available.)",
+      metrics: { outcome: "fallback" },
+    };
   }
 }
 
@@ -197,6 +232,8 @@ async function postResult(payload) {
   } catch { /* leaderboard is optional */ }
 }
 const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+const fmtSecs = (ms) => (ms == null ? "-" : `${(ms / 1000).toFixed(1)}s`);
+const fmtUsd = (x) => (x == null ? "-" : x < 0.01 ? `$${x.toFixed(4)}` : `$${x.toFixed(3)}`);
 
 /* ============================ THEME ============================ */
 const CSS = `
@@ -302,6 +339,11 @@ const CSS = `
 .lb-row .res{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:6px;font-size:11px;font-weight:800;}
 .lb-row .res.win{background:rgba(120,190,120,.18);color:#9fd39f;}
 .lb-row .res.loss{background:rgba(200,110,110,.16);color:#d79a9a;}
+.lb-perf{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:2px 0 22px;}
+@media(max-width:640px){.lb-perf{grid-template-columns:repeat(2,1fr);}}
+.pstat{border:1px solid #33281a;border-radius:11px;padding:10px 12px;background:rgba(0,0,0,.2);}
+.pstat span{display:block;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);font-weight:700;}
+.pstat b{font-family:'Fraunces',serif;font-weight:600;font-size:21px;color:var(--bone);font-variant-numeric:tabular-nums;}
 `;
 
 /* ============================ SVG PIECES ============================ */
@@ -530,6 +572,18 @@ function ModelHistory({ model, onBack }) {
           {d && d.found && <div className="lb-sub">Rating {d.rating} ±{d.rd} · {d.wins}-{d.losses} across {d.games} games{d.provisional ? " · provisional" : ""}{d.gammons ? ` · ${d.gammons} gammons` : ""}</div>}
         </div>
       </div>
+      {d && d.perf && (
+        <div className="lb-perf">
+          <div className="pstat"><span>Median move</span><b>{fmtSecs(d.perf.medianLatencyMs)}</b></div>
+          <div className="pstat"><span>95th percentile</span><b>{fmtSecs(d.perf.p95LatencyMs)}</b></div>
+          <div className="pstat"><span>Cost / move</span><b>{fmtUsd(d.perf.avgNotionalPerMove)}</b></div>
+          <div className="pstat"><span>Cost / game</span><b>{fmtUsd(d.perf.avgNotionalPerGame)}</b></div>
+          <div className="pstat"><span>Tokens / move</span><b>{d.perf.avgTokensPerMove != null ? Math.round(d.perf.avgTokensPerMove) : "-"}</b></div>
+          <div className="pstat"><span>Reliability</span><b>{d.perf.reliability != null ? pct(d.perf.reliability) : "-"}</b></div>
+          <div className="pstat"><span>Engine agreement</span><b>{d.perf.agreement != null ? pct(d.perf.agreement) : "-"}</b></div>
+          <div className="pstat"><span>Play quality</span><b>{d.perf.avgQuality != null ? pct(d.perf.avgQuality) : "-"}</b></div>
+        </div>
+      )}
       {state === "error" && <div className="lb-empty">Could not load this model's history.</div>}
       {state === "ok" && opps.length === 0 && <div className="lb-empty">No games recorded for this model yet.</div>}
       {opps.length > 0 && (
@@ -576,6 +630,7 @@ function Leaderboard() {
   const [matches, setMatches] = useState([]);
   const [state, setState] = useState("loading"); // loading | ok | error
   const [selected, setSelected] = useState(null);
+  const [tab, setTab] = useState("ranking"); // ranking | performance
 
   const load = useCallback(async () => {
     setState("loading");
@@ -599,15 +654,23 @@ function Leaderboard() {
       <div className="lb-head">
         <div>
           <h2 className="lb-title">Leaderboard</h2>
-          <div className="lb-sub">Glicko-2 rating from every completed game - higher is stronger. The ± is how uncertain the rating still is (smaller is more settled); models still finding their level are marked provisional. Click a model to see its history.</div>
+          <div className="lb-sub">{tab === "ranking"
+            ? "Glicko-2 rating from every completed game - higher is stronger. The ± is how uncertain the rating still is; models still finding their level are marked provisional. Click a model for its history."
+            : "How each model performs per move: speed, cost (notional API price), reliability (share of moves it answered, versus falling back to the engine), and play quality (how often it matched the engine's best play). Click a model for more."}</div>
         </div>
-        <button className="btn" onClick={load}><RotateCcw size={15} />Refresh</button>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <div className="speed" role="group" aria-label="Leaderboard view">
+            <button className={tab === "ranking" ? "on" : ""} onClick={() => setTab("ranking")}>Ranking</button>
+            <button className={tab === "performance" ? "on" : ""} onClick={() => setTab("performance")}>Performance</button>
+          </div>
+          <button className="btn" onClick={load}><RotateCcw size={15} />Refresh</button>
+        </div>
       </div>
 
       {state === "error" && <div className="lb-empty">Could not reach the leaderboard. Is the model proxy running (<code>npm run server</code>)?</div>}
       {state !== "error" && rows.length === 0 && <div className="lb-empty">No games recorded yet. Play a match in the Arena and the result lands here.</div>}
 
-      {rows.length > 0 && (
+      {rows.length > 0 && tab === "ranking" && (
         <div className="lb-tablewrap">
           <table className="lb-table">
             <thead>
@@ -625,6 +688,30 @@ function Leaderboard() {
                   <td className="n">{r.gammons}{r.gammons ? <span className="muted"> ({pct(r.gammonPct)})</span> : null}</td>
                 </tr>
               ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {rows.length > 0 && tab === "performance" && (
+        <div className="lb-tablewrap">
+          <table className="lb-table">
+            <thead>
+              <tr><th className="r">#</th><th>Model</th><th className="n">Rating</th><th className="n">Speed</th><th className="n">Cost / game</th><th className="n">Tokens / move</th><th className="n">Reliability</th><th className="n">Quality</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => { const p = r.perf; return (
+                <tr key={r.model} className="click" onClick={() => setSelected(r.model)} title="View history">
+                  <td className="r">{i + 1}</td>
+                  <td className="mname">{MODEL_NAME(r.model)}</td>
+                  <td className="n"><span className="strong">{r.rating}</span></td>
+                  <td className="n">{p ? fmtSecs(p.medianLatencyMs) : "-"}</td>
+                  <td className="n">{p ? fmtUsd(p.avgNotionalPerGame) : "-"}</td>
+                  <td className="n">{p && p.avgTokensPerMove != null ? Math.round(p.avgTokensPerMove) : "-"}</td>
+                  <td className="n">{p && p.reliability != null ? pct(p.reliability) : "-"}</td>
+                  <td className="n">{p && p.avgQuality != null ? pct(p.avgQuality) : "-"}</td>
+                </tr>
+              ); })}
             </tbody>
           </table>
         </div>
@@ -671,6 +758,7 @@ export default function App() {
   const modelsRef = useRef(models), speedRef = useRef(speed), runId = useRef(0), moveNo = useRef(0);
   const thinkingRef = useRef(thinking);
   const flyerRef = useRef(null);
+  const movesRef = useRef([]); // per-move metric records for the current game
 
   useEffect(() => { modelsRef.current = models; }, [models]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
@@ -688,7 +776,7 @@ export default function App() {
   const resetGame = useCallback(() => {
     runId.current++; runningRef.current = false; setRunning(false);
     const b = initialBoard();
-    boardRef.current = b; turnRef.current = "W"; moveNo.current = 0;
+    boardRef.current = b; turnRef.current = "W"; moveNo.current = 0; movesRef.current = [];
     setBoard(b); setTurn("W"); setDice({ W: null, B: null }); setReason({ W: "", B: "" });
     setThinkingSide(null); setHighlight(null); setLog([]); setWin(null); setPhase("idle");
   }, []);
@@ -719,14 +807,31 @@ export default function App() {
 
     const plays = legalPlays(boardRef.current, pl, d);
     let chosen, reasoning;
-    if (plays.length === 1 && plays[0].moves.length === 0) { chosen = plays[0]; reasoning = "No legal move with this roll - the turn passes."; }
-    else if (plays.length === 1) { chosen = plays[0]; reasoning = "Only one legal play here - it makes itself."; }
+    const rec = { model: modelsRef.current[pl], side: pl, thinking: thinkingRef.current ? 1 : 0, board_context: 1, options: plays.length };
+    if (plays.length === 1 && plays[0].moves.length === 0) { chosen = plays[0]; reasoning = "No legal move with this roll - the turn passes."; rec.outcome = "forced"; }
+    else if (plays.length === 1) { chosen = plays[0]; reasoning = "Only one legal play here - it makes itself."; rec.outcome = "forced"; }
     else {
       setPhase("thinking"); setThinkingSide(pl); setReason((r) => ({ ...r, [pl]: "" }));
       const res = await askModel(boardRef.current, pl, d, plays, modelsRef.current[pl], thinkingRef.current);
       if (runId.current !== myId) return;
       chosen = plays[res.choice]; reasoning = res.reasoning;
+      const mm = res.metrics || {};
+      rec.outcome = mm.outcome || "model";
+      if (rec.outcome === "model") {
+        rec.latency_ms = mm.latencyMs ?? null;
+        rec.api_ms = mm.durationMs ?? null;
+        rec.input_tokens = mm.inputTokens ?? null;
+        rec.output_tokens = mm.outputTokens ?? null;
+        rec.cache_read_tokens = mm.cacheReadTokens ?? null;
+        rec.cost_usd = mm.costUsd ?? null;
+        rec.notional_usd = mm.notionalUsd ?? null;
+        const ev = heuristicEval(plays, pl), c = res.choice, cs = ev.scores[c];
+        const hi = ev.scores[ev.best], lo = ev.scores[ev.worst];
+        rec.optimal = cs === hi ? 1 : 0;
+        rec.quality = hi === lo ? 1 : (cs - lo) / (hi - lo);
+      }
     }
+    movesRef.current.push(rec);
     setThinkingSide(null); setReason((r) => ({ ...r, [pl]: reasoning }));
     await sleep(t.read); if (runId.current !== myId) return;
 
@@ -770,7 +875,9 @@ export default function App() {
         margin_pips: pipCount(b, lo),
         speed: speedRef.current,
         thinking: thinkingRef.current,
+        moves: movesRef.current.slice(),
       });
+      movesRef.current = [];
       return;
     }
     turnRef.current = opp(pl); setTurn(opp(pl));

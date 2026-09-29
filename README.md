@@ -38,7 +38,8 @@ It began life as a single-file [Claude artifact](https://claude.ai) and has been
 - **Pacing and depth controls.** Slow / Normal / Fast animation speed, plus an Extended thinking toggle for deeper but slower play.
 - **Move history log.** Every play recorded in standard notation with its dice.
 - **Leaderboard with Glicko-2 ratings.** Completed games are saved to a local database and each model earns a Glicko-2 rating that reflects who it beat, not just how often, along with a ± uncertainty that shrinks as it plays. Click a model to see its head-to-head record against every opponent.
-- **Matchmaker.** A "Suggest match" button picks the most useful next pairing (similar ratings, models that still need games), so a growing roster of models gets rated fairly without every model playing every other.
+- **Matchmaker.** A "Suggest match" button picks the most useful next pairing (similar ratings, high-uncertainty models that still need games), so a growing roster of models gets rated fairly without every model playing every other.
+- **Per-move performance metrics.** Every model decision records latency, tokens, a notional API cost, reliability (did the model answer, or did it fall back to the engine), and play quality (how often it matched the engine's best move). The leaderboard has a Performance view and each model's history shows its metrics.
 
 ## Quick start
 
@@ -80,9 +81,10 @@ The most important design decision is that the engine, not the model, owns the r
 On each turn the engine rolls the dice and computes every legal play for that roll.
 The model is only ever asked to choose an index from that list and give a one-sentence reason.
 This means a model can never make an illegal move no matter how it formats its reply, which matters in a game as fiddly as backgammon.
+The prompt shows the model the full board from its own perspective (its ace point numbered 1), the pip counts and the opponent's blots, and the numbered legal plays, each pre-scored with the hits it makes and its resulting pip count and blots.
 
 The model is prompted to return strict JSON of the form `{ "choice": <index>, "reasoning": "<text>" }`.
-If a call fails, times out, or the reply cannot be parsed, the app falls back first to a simpler model, then to a built-in heuristic, so the game never stalls.
+If a call fails, times out, or the reply cannot be parsed, the app falls back straight to a built-in heuristic (never to a different model, so a model is never credited with another model's move), so the game never stalls.
 
 The board is drawn with a single SVG using filters for the wood and felt textures.
 Checker movement uses the Web Animations API for a lifted, arced slide, and the dice are real CSS 3D cubes that tumble and settle on the rolled face.
@@ -120,11 +122,25 @@ A newly added model starts with a wide RD and is prioritised until its rating se
 
 The proxy exposes these endpoints:
 
-- `POST /api/result` records one finished game.
-- `GET /api/leaderboard` returns the standings with ratings.
+- `POST /api/result` records one finished game, and its per-move metrics if a `moves` array is included.
+- `GET /api/leaderboard` returns the standings with ratings and per-model performance metrics.
 - `GET /api/matches?limit=n` returns recent games.
-- `GET /api/head-to-head?model=<id>` returns one model's record against each opponent.
+- `GET /api/head-to-head?model=<id>` returns one model's record and metrics against each opponent.
 - `POST /api/next-match` with `{ "models": ["id", ...] }` returns the suggested next pairing.
+- `POST /api/move` returns the model's reply plus `metrics` (SDK duration, tokens, cost, and a notional cost).
+
+## Metrics
+
+Because a benchmark is about more than who wins, every model decision is recorded to a `moves` table with:
+
+- **Latency** - wall-clock time for the move, plus the SDK's own model duration.
+- **Tokens and cost** - input/output tokens, the SDK's reported cost (which is $0 on a subscription), and a **notional cost** computed from list prices, so you can compare what each model would cost on the pay-as-you-go API.
+- **Outcome** - whether the selected model answered (`model`), the engine had to fill in (`fallback`), or there was only one legal play (`forced`). A model is never credited with another model's move: on failure it falls straight back to the engine, which registers as a fallback rather than a substitute model.
+- **Play quality** - each real decision is graded against the engine heuristic: `optimal` (did it pick the engine-best play) and a `quality` score from 0 (worst play) to 1 (best). Because dice are noisy, this per-move signal accumulates far faster than win-loss.
+
+The Leaderboard's Performance view aggregates these per model: median move speed, cost per game, tokens per move, reliability, and play quality. A model's history view shows the full set, including the 95th-percentile latency and engine-agreement rate.
+
+Notional prices live in the `PRICES` table in `server/index.mjs`; update them if list prices change.
 
 If `node:sqlite` is unavailable or the database cannot be opened, the proxy runs without a leaderboard and the game is unaffected.
 Delete `data/tabula.db` to reset the standings.

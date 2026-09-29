@@ -34,6 +34,29 @@ const MODEL_MAP = {
 };
 const resolveModel = (id) => MODEL_MAP[id] || id;
 
+// List prices ($ per million tokens: [input, output]) for a notional per-move
+// cost. On a subscription the SDK reports $0, so this shows what a move would
+// cost on the pay-as-you-go API - the useful number for comparing models.
+const PRICES = {
+  "claude-opus-5-5": [4, 20],
+  "claude-opus-5": [5, 25],
+  "claude-opus-4-8": [5, 25],
+  "claude-sonnet-5-5": [2, 10],
+  "claude-sonnet-5": [2, 10],
+  "claude-sonnet-4-6": [3, 15],
+  "claude-haiku-4-5-20251001": [1, 5],
+  "claude-fable-5-1": [10, 50],
+};
+// Notional $ for a move. The Agent SDK caches the prompt heavily, so most input
+// arrives as cache reads (~0.1x the input price); include them or cost is wildly
+// understated. Any token field may be null (older rows) and is treated as 0.
+function notionalCost(model, inTok, outTok, cacheTok) {
+  const p = PRICES[model];
+  if (!p) return null;
+  const i = inTok || 0, o = outTok || 0, c = cacheTok || 0;
+  return (i / 1e6) * p[0] + (o / 1e6) * p[1] + (c / 1e6) * p[0] * 0.1;
+}
+
 /* ---------------- Leaderboard storage (SQLite) ----------------
  * Uses Node's built-in node:sqlite (no native build). If it is unavailable
  * (older Node) or the file cannot be opened, the server runs without a
@@ -64,26 +87,134 @@ try {
     speed TEXT,
     thinking INTEGER NOT NULL DEFAULT 0
   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS moves (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id INTEGER,
+    played_at TEXT,
+    model TEXT NOT NULL,
+    side TEXT,
+    outcome TEXT,               -- model | fallback | forced
+    latency_ms INTEGER,         -- wall-clock, model decisions only
+    api_ms INTEGER,             -- SDK-reported model duration
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cost_usd REAL,              -- SDK-reported (0 on a subscription)
+    notional_usd REAL,         -- computed from list prices
+    thinking INTEGER,
+    options INTEGER,            -- number of legal plays offered
+    optimal INTEGER,           -- 1/0/NULL: chose the engine-best play
+    quality REAL,              -- 0..1/NULL: engine-agreement score of the pick
+    board_context INTEGER      -- 1/0: full board was included in the prompt
+  )`);
+  // Add columns to a pre-existing moves table (no-op if they already exist).
+  try { db.exec(`ALTER TABLE moves ADD COLUMN board_context INTEGER`); } catch { /* exists */ }
 } catch (err) {
   console.log("NOTE: leaderboard database unavailable (" + (err && err.message) + "); results will not be saved.");
   db = null;
 }
 
+const intOrNull = (x) => (Number.isFinite(x) ? Math.round(x) : null);
+const numOrNull = (x) => (Number.isFinite(x) ? x : null);
+const triState = (x) => (x === 1 || x === 0 ? x : x === true ? 1 : x === false ? 0 : null);
+
+// Insert one finished game and, atomically, its per-move metric rows.
 function recordResult(r) {
   if (!db) return;
-  db.prepare(
-    `INSERT INTO matches (played_at, winner_model, loser_model, winner_side, is_gammon, margin_pips, speed, thinking)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    new Date().toISOString(),
-    String(r.winner_model),
-    String(r.loser_model),
-    r.winner_side ? String(r.winner_side) : null,
-    r.is_gammon ? 1 : 0,
-    Number.isFinite(r.margin_pips) ? Math.round(r.margin_pips) : null,
-    r.speed ? String(r.speed) : null,
-    r.thinking ? 1 : 0,
-  );
+  const now = new Date().toISOString();
+  const moves = Array.isArray(r.moves) ? r.moves : [];
+  db.exec("BEGIN");
+  try {
+    const info = db.prepare(
+      `INSERT INTO matches (played_at, winner_model, loser_model, winner_side, is_gammon, margin_pips, speed, thinking)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      now,
+      String(r.winner_model),
+      String(r.loser_model),
+      r.winner_side ? String(r.winner_side) : null,
+      r.is_gammon ? 1 : 0,
+      intOrNull(r.margin_pips),
+      r.speed ? String(r.speed) : null,
+      r.thinking ? 1 : 0,
+    );
+    const matchId = info.lastInsertRowid;
+    if (moves.length) {
+      const stmt = db.prepare(
+        `INSERT INTO moves (match_id, played_at, model, side, outcome, latency_ms, api_ms,
+           input_tokens, output_tokens, cache_read_tokens, cost_usd, notional_usd, thinking, options, optimal, quality, board_context)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const m of moves) {
+        stmt.run(
+          matchId, now, String(m.model || ""), m.side ? String(m.side) : null,
+          m.outcome ? String(m.outcome) : null,
+          intOrNull(m.latency_ms), intOrNull(m.api_ms),
+          intOrNull(m.input_tokens), intOrNull(m.output_tokens), intOrNull(m.cache_read_tokens),
+          numOrNull(m.cost_usd), numOrNull(m.notional_usd),
+          m.thinking ? 1 : 0, intOrNull(m.options), triState(m.optimal), numOrNull(m.quality),
+          m.board_context ? 1 : 0,
+        );
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+const percentile = (sorted, p) => {
+  if (!sorted.length) return null;
+  const i = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[i];
+};
+
+// Aggregate the per-move rows into performance metrics per model.
+function moveMetrics() {
+  const map = new Map();
+  if (!db) return map;
+  const rows = db.prepare(
+    `SELECT model, outcome, latency_ms, input_tokens, output_tokens, cache_read_tokens, optimal, quality, match_id FROM moves`,
+  ).all();
+  const acc = new Map();
+  for (const r of rows) {
+    if (!acc.has(r.model)) acc.set(r.model, {
+      decisions: 0, fallbacks: 0, forced: 0, latencies: [], notional: 0,
+      tokens: 0, optimalCount: 0, optimalSum: 0, quality: [], games: new Set(),
+    });
+    const a = acc.get(r.model);
+    if (r.match_id != null) a.games.add(r.match_id);
+    if (r.outcome === "model") {
+      a.decisions++;
+      if (r.latency_ms != null) a.latencies.push(r.latency_ms);
+      // Recompute cost from tokens so pricing (incl. cache reads) is consistent
+      // across all rows, even ones stored before the pricing was corrected.
+      const cost = notionalCost(r.model, r.input_tokens, r.output_tokens, r.cache_read_tokens);
+      if (cost != null) a.notional += cost;
+      a.tokens += (r.input_tokens || 0) + (r.output_tokens || 0) + (r.cache_read_tokens || 0);
+      if (r.optimal != null) { a.optimalCount++; a.optimalSum += r.optimal; }
+      if (r.quality != null) a.quality.push(r.quality);
+    } else if (r.outcome === "fallback") a.fallbacks++;
+    else if (r.outcome === "forced") a.forced++;
+  }
+  for (const [model, a] of acc) {
+    const lat = a.latencies.slice().sort((x, y) => x - y);
+    const attempts = a.decisions + a.fallbacks;
+    const gameCount = a.games.size || 1;
+    map.set(model, {
+      decisions: a.decisions, fallbacks: a.fallbacks, forced: a.forced,
+      medianLatencyMs: percentile(lat, 50),
+      p95LatencyMs: percentile(lat, 95),
+      avgTokensPerMove: a.decisions ? a.tokens / a.decisions : null,
+      avgNotionalPerMove: a.decisions ? a.notional / a.decisions : null,
+      avgNotionalPerGame: a.notional ? a.notional / gameCount : (a.decisions ? 0 : null),
+      reliability: attempts ? a.decisions / attempts : null,
+      agreement: a.optimalCount ? a.optimalSum / a.optimalCount : null,
+      avgQuality: a.quality.length ? a.quality.reduce((s, q) => s + q, 0) / a.quality.length : null,
+    });
+  }
+  return map;
 }
 
 // One Glicko-2 rating-period update for a single model.
@@ -215,7 +346,8 @@ function rowOf(s) {
 }
 
 function leaderboard() {
-  const rows = [...computeStats().values()].map(rowOf);
+  const perf = moveMetrics();
+  const rows = [...computeStats().values()].map((s) => ({ ...rowOf(s), perf: perf.get(s.model) || null }));
   // Established models (tight RD) first by rating; provisional ones after, also by rating.
   rows.sort((a, b) =>
     (a.provisional - b.provisional) || (b.rating - a.rating) || (a.rd - b.rd) || a.model.localeCompare(b.model));
@@ -236,7 +368,9 @@ function headToHead(model) {
     model, found: true, rating: Math.round(s.rating), rd: Math.round(s.rd),
     games: s.games, wins: s.wins, losses: s.losses,
     gammons: s.gammons, gammonsAgainst: s.gammonsAgainst,
-    provisional: s.rd > RD_ESTABLISHED, opponents, recent,
+    provisional: s.rd > RD_ESTABLISHED,
+    perf: moveMetrics().get(model) || null,
+    opponents, recent,
   };
 }
 
@@ -282,7 +416,7 @@ async function askModel({ model, system, user, thinking }) {
   const think = !!thinking;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), think ? THINK_TIMEOUT_MS : MOVE_TIMEOUT_MS);
-  let text = "";
+  let text = "", meta = {};
   try {
     for await (const msg of query({
       prompt: user,
@@ -298,13 +432,23 @@ async function askModel({ model, system, user, thinking }) {
         abortController: ac, // enforce the timeout so a slow move can't freeze the game
       },
     })) {
-      if (msg.type === "result" && msg.subtype === "success") text = msg.result;
+      if (msg.type === "result" && msg.subtype === "success") {
+        text = msg.result;
+        const u = msg.usage || {};
+        meta = {
+          apiMs: msg.duration_ms ?? null,
+          costUsd: msg.total_cost_usd ?? null,
+          inputTokens: u.input_tokens ?? null,
+          outputTokens: u.output_tokens ?? null,
+          cacheReadTokens: u.cache_read_input_tokens ?? null,
+        };
+      }
     }
   } finally {
     clearTimeout(timer);
   }
   if (!text) throw new Error("empty or timed-out response from model");
-  return text;
+  return { text, meta };
 }
 
 function readBody(req) {
@@ -326,8 +470,18 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/move") {
       const { model, system, user, thinking } = JSON.parse((await readBody(req)) || "{}");
       if (!model || !system || !user) return send(400, { error: "model, system and user are required" });
-      const text = await askModel({ model, system, user, thinking });
-      return send(200, { text });
+      const { text, meta } = await askModel({ model, system, user, thinking });
+      return send(200, {
+        text,
+        metrics: {
+          durationMs: meta.apiMs,
+          inputTokens: meta.inputTokens,
+          outputTokens: meta.outputTokens,
+          cacheReadTokens: meta.cacheReadTokens,
+          costUsd: meta.costUsd,
+          notionalUsd: notionalCost(model, meta.inputTokens, meta.outputTokens, meta.cacheReadTokens),
+        },
+      });
     }
     if (req.method === "POST" && url.pathname === "/api/result") {
       const body = JSON.parse((await readBody(req)) || "{}");
